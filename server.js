@@ -47,7 +47,7 @@ function broadcast(payload, room) {
   const data = JSON.stringify(payload);
   for (const socket of wss.clients) {
     const client = clients.get(socket);
-    if (socket.readyState === WebSocket.OPEN && (!room || (client && client.room === room))) socket.send(data);
+    if (socket.readyState === WebSocket.OPEN && (!room || (client && client.room.toLowerCase() === room.toLowerCase()))) socket.send(data);
   }
 }
 function onlineCount(room) {
