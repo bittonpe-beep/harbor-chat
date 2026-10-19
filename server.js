@@ -1,14 +1,30 @@
 const http = require("node:http");
 const fs = require("node:fs");
 const path = require("node:path");
+const crypto = require("node:crypto");
 const { WebSocketServer, WebSocket } = require("ws");
+const { Pool } = require("pg");
 
 const port = Number(process.env.PORT || 3000);
 const htmlPath = path.join(__dirname, "index.html");
+const MAX_HISTORY = 100;
+const MAX_MESSAGE_LENGTH = 2000;
+const history = [];
+const clients = new Map();
+const pool = process.env.DATABASE_URL
+  ? new Pool({
+      connectionString: process.env.DATABASE_URL,
+      ssl: process.env.DATABASE_SSL === "false" ? false : { rejectUnauthorized: false },
+      max: 5,
+      idleTimeoutMillis: 30000,
+      connectionTimeoutMillis: 10000
+    })
+  : null;
+
 const server = http.createServer((req, res) => {
   if (req.url === "/healthz") {
     res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
-    return res.end(JSON.stringify({ ok: true, app: "harbor-chat" }));
+    return res.end(JSON.stringify({ ok: true, app: "harbor-chat", persistence: pool ? "postgres" : "memory-only" }));
   }
   if (req.url === "/" || req.url === "/index.html") {
     fs.readFile(htmlPath, (err, data) => {
@@ -26,10 +42,6 @@ const server = http.createServer((req, res) => {
 });
 
 const wss = new WebSocketServer({ server });
-const clients = new Map();
-const history = [];
-const MAX_HISTORY = 100;
-const MAX_MESSAGE_LENGTH = 2000;
 
 function broadcast(payload) {
   const data = JSON.stringify(payload);
@@ -40,12 +52,26 @@ function broadcast(payload) {
 function onlineCount() {
   return [...clients.values()].filter(c => c.joined).length;
 }
+function addToRecentHistory(message) {
+  history.push(message);
+  if (history.length > MAX_HISTORY) history.shift();
+}
+async function saveMessage(message) {
+  if (pool) {
+    await pool.query(
+      "INSERT INTO chat_messages (id, type, name, text, time) VALUES ($1, $2, $3, $4, $5)",
+      [message.id || crypto.randomUUID(), message.type, message.name || null, message.text, message.time]
+    );
+  }
+  addToRecentHistory(message);
+}
+
 wss.on("connection", (socket) => {
   const client = { name: "Guest", joined: false };
   clients.set(socket, client);
   socket.send(JSON.stringify({ type: "welcome", history, online: onlineCount() }));
 
-  socket.on("message", (raw) => {
+  socket.on("message", async (raw) => {
     let data;
     try { data = JSON.parse(raw.toString()); } catch { return; }
     if (!data || typeof data !== "object") return;
@@ -57,9 +83,15 @@ wss.on("connection", (socket) => {
       client.joined = true;
       socket.send(JSON.stringify({ type: "joined", name }));
       if (!wasJoined) {
-        const system = { type: "system", text: name + " joined the chat", time: new Date().toISOString() };
-        history.push(system); if (history.length > MAX_HISTORY) history.shift();
-        broadcast(system);
+        const system = { type: "system", id: crypto.randomUUID(), text: name + " joined the chat", time: new Date().toISOString() };
+        try {
+          await saveMessage(system);
+          broadcast(system);
+        } catch (err) {
+          console.error("Could not save join notice:", err.message);
+          addToRecentHistory(system);
+          broadcast(system);
+        }
       }
       broadcast({ type: "presence", online: onlineCount() });
       return;
@@ -70,25 +102,72 @@ wss.on("connection", (socket) => {
       if (!text) return;
       const message = {
         type: "chat",
-        id: require("node:crypto").randomUUID(),
+        id: crypto.randomUUID(),
         name: client.name,
         text,
         time: new Date().toISOString()
       };
-      history.push(message); if (history.length > MAX_HISTORY) history.shift();
-      broadcast(message);
+      try {
+        await saveMessage(message);
+        broadcast(message);
+      } catch (err) {
+        console.error("Could not persist chat message; message was not broadcast:", err.message);
+        if (socket.readyState === WebSocket.OPEN) {
+          socket.send(JSON.stringify({ type: "storage-error", text: "Your message could not be saved. Please try again." }));
+        }
+      }
     }
   });
 
-  socket.on("close", () => {
+  socket.on("close", async () => {
     const hadJoined = client.joined;
     clients.delete(socket);
     if (hadJoined) {
-      const system = { type: "system", text: client.name + " left the chat", time: new Date().toISOString() };
-      history.push(system); if (history.length > MAX_HISTORY) history.shift();
+      const system = { type: "system", id: crypto.randomUUID(), text: client.name + " left the chat", time: new Date().toISOString() };
+      try {
+        await saveMessage(system);
+      } catch (err) {
+        console.error("Could not save leave notice:", err.message);
+        addToRecentHistory(system);
+      }
       broadcast(system);
     }
     broadcast({ type: "presence", online: onlineCount() });
   });
 });
-server.listen(port, "0.0.0.0", () => console.log("Harbor Chat real-time server listening on " + port));
+
+async function start() {
+  if (pool) {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS chat_messages (
+        id TEXT PRIMARY KEY,
+        type TEXT NOT NULL,
+        name TEXT,
+        text TEXT NOT NULL,
+        time TIMESTAMPTZ NOT NULL
+      )
+    `);
+    const result = await pool.query(
+      "SELECT id, type, name, text, time FROM chat_messages ORDER BY time DESC LIMIT $1",
+      [MAX_HISTORY]
+    );
+    for (const row of result.rows.reverse()) {
+      history.push({
+        type: row.type,
+        id: row.id,
+        ...(row.name ? { name: row.name } : {}),
+        text: row.text,
+        time: new Date(row.time).toISOString()
+      });
+    }
+    console.log("Loaded " + history.length + " recent messages from PostgreSQL.");
+  } else {
+    console.warn("DATABASE_URL is not set; chat history will not survive restarts until PostgreSQL is connected.");
+  }
+  server.listen(port, "0.0.0.0", () => console.log("Harbor Chat listening on " + port));
+}
+
+start().catch(err => {
+  console.error("Could not initialize chat storage:", err);
+  process.exit(1);
+});
