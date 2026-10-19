@@ -43,14 +43,15 @@ const server = http.createServer((req, res) => {
 
 const wss = new WebSocketServer({ server });
 
-function broadcast(payload) {
+function broadcast(payload, room) {
   const data = JSON.stringify(payload);
-  for (const client of wss.clients) {
-    if (client.readyState === WebSocket.OPEN) client.send(data);
+  for (const socket of wss.clients) {
+    const client = clients.get(socket);
+    if (socket.readyState === WebSocket.OPEN && (!room || (client && client.room === room))) socket.send(data);
   }
 }
-function onlineCount() {
-  return [...clients.values()].filter(c => c.joined).length;
+function onlineCount(room) {
+  return [...clients.values()].filter(c => c.joined && (!room || c.room === room)).length;
 }
 function addToRecentHistory(message) {
   history.push(message);
@@ -59,17 +60,19 @@ function addToRecentHistory(message) {
 async function saveMessage(message) {
   if (pool) {
     await pool.query(
-      "INSERT INTO chat_messages (id, type, name, text, time) VALUES ($1, $2, $3, $4, $5)",
-      [message.id || crypto.randomUUID(), message.type, message.name || null, message.text, message.time]
+      "INSERT INTO chat_messages (id, type, name, text, time, room) VALUES ($1, $2, $3, $4, $5, $6)",
+      [message.id || crypto.randomUUID(), message.type, message.name || null, message.text, message.time, message.room || "Harbor Lounge"]
     );
   }
   addToRecentHistory(message);
 }
 
-wss.on("connection", (socket) => {
-  const client = { name: "Guest", joined: false };
+wss.on("connection", (socket, request) => {
+  const rawRoom = new URL(request.url, "http://localhost").searchParams.get("room") || "Harbor Lounge";
+  const room = rawRoom.trim().replace(/\s+/g, " ").slice(0, 40) || "Harbor Lounge";
+  const client = { name: "Guest", joined: false, room };
   clients.set(socket, client);
-  socket.send(JSON.stringify({ type: "welcome", history, online: onlineCount() }));
+  socket.send(JSON.stringify({ type: "welcome", history: history.filter(m => (m.room || "Harbor Lounge").toLowerCase() === room.toLowerCase()), online: onlineCount(room) }));
 
   socket.on("message", async (raw) => {
     let data;
@@ -83,17 +86,17 @@ wss.on("connection", (socket) => {
       client.joined = true;
       socket.send(JSON.stringify({ type: "joined", name }));
       if (!wasJoined) {
-        const system = { type: "system", id: crypto.randomUUID(), text: name + " joined the chat", time: new Date().toISOString() };
+        const system = { type: "system", id: crypto.randomUUID(), text: name + " joined the chat", time: new Date().toISOString(), room: client.room };
         try {
           await saveMessage(system);
-          broadcast(system);
+          broadcast(system, client.room);
         } catch (err) {
           console.error("Could not save join notice:", err.message);
           addToRecentHistory(system);
           broadcast(system);
         }
       }
-      broadcast({ type: "presence", online: onlineCount() });
+      broadcast({ type: "presence", online: onlineCount(client.room) }, client.room);
       return;
     }
 
@@ -105,7 +108,8 @@ wss.on("connection", (socket) => {
         id: crypto.randomUUID(),
         name: client.name,
         text,
-        time: new Date().toISOString()
+        time: new Date().toISOString(),
+        room: client.room
       };
       try {
         await saveMessage(message);
@@ -123,7 +127,7 @@ wss.on("connection", (socket) => {
     const hadJoined = client.joined;
     clients.delete(socket);
     if (hadJoined) {
-      const system = { type: "system", id: crypto.randomUUID(), text: client.name + " left the chat", time: new Date().toISOString() };
+      const system = { type: "system", id: crypto.randomUUID(), text: client.name + " left the chat", time: new Date().toISOString(), room: client.room };
       try {
         await saveMessage(system);
       } catch (err) {
@@ -144,11 +148,13 @@ async function start() {
         type TEXT NOT NULL,
         name TEXT,
         text TEXT NOT NULL,
-        time TIMESTAMPTZ NOT NULL
+        time TIMESTAMPTZ NOT NULL,
+        room TEXT NOT NULL DEFAULT 'Harbor Lounge'
       )
     `);
+    await pool.query("ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS room TEXT NOT NULL DEFAULT 'Harbor Lounge'");
     const result = await pool.query(
-      "SELECT id, type, name, text, time FROM chat_messages ORDER BY time DESC LIMIT $1",
+      "SELECT id, type, name, text, time, room FROM chat_messages ORDER BY time DESC LIMIT $1",
       [MAX_HISTORY]
     );
     for (const row of result.rows.reverse()) {
@@ -157,6 +163,7 @@ async function start() {
         id: row.id,
         ...(row.name ? { name: row.name } : {}),
         text: row.text,
+        room: row.room || "Harbor Lounge",
         time: new Date(row.time).toISOString()
       });
     }
