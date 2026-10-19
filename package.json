@@ -1,0 +1,12 @@
+{
+  "name": "harbor-chat",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Harbor Chat web app",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
