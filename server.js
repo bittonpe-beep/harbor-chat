@@ -26,7 +26,7 @@ const server = http.createServer((req, res) => {
     res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
     return res.end(JSON.stringify({ ok: true, app: "harbor-chat", persistence: pool ? "postgres" : "memory-only" }));
   }
-  if (req.url === "/" || req.url === "/index.html") {
+  if (new URL(req.url, "http://localhost").pathname === "/" || new URL(req.url, "http://localhost").pathname === "/index.html") {
     fs.readFile(htmlPath, (err, data) => {
       if (err) {
         res.writeHead(500, { "content-type": "text/plain; charset=utf-8" });
