@@ -51,7 +51,7 @@ function broadcast(payload, room) {
   }
 }
 function onlineCount(room) {
-  return [...clients.values()].filter(c => c.joined && (!room || c.room === room)).length;
+  return [...clients.values()].filter(c => c.joined && (!room || c.room.toLowerCase() === room.toLowerCase())).length;
 }
 function addToRecentHistory(message) {
   history.push(message);
@@ -93,7 +93,7 @@ wss.on("connection", (socket, request) => {
         } catch (err) {
           console.error("Could not save join notice:", err.message);
           addToRecentHistory(system);
-          broadcast(system);
+          broadcast(system, client.room);
         }
       }
       broadcast({ type: "presence", online: onlineCount(client.room) }, client.room);
@@ -113,7 +113,7 @@ wss.on("connection", (socket, request) => {
       };
       try {
         await saveMessage(message);
-        broadcast(message);
+        broadcast(message, client.room);
       } catch (err) {
         console.error("Could not persist chat message; message was not broadcast:", err.message);
         if (socket.readyState === WebSocket.OPEN) {
@@ -134,9 +134,9 @@ wss.on("connection", (socket, request) => {
         console.error("Could not save leave notice:", err.message);
         addToRecentHistory(system);
       }
-      broadcast(system);
+      broadcast(system, client.room);
     }
-    broadcast({ type: "presence", online: onlineCount() });
+    broadcast({ type: "presence", online: onlineCount(client.room) }, client.room);
   });
 });
 
